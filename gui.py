@@ -1,3 +1,4 @@
+from json.decoder import JSONDecodeError
 from tkinter import *
 from tkinter import messagebox
 from tkinter.filedialog import askopenfilename
@@ -15,13 +16,13 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
 from constants import *
+from pages.start_page import *
+from pages.video_page import *
+from pages.channel_page import *
+from pages.login_page import *
+from pages.help_page import *
 
-PAGES = [
-    'StartPage',
-    'SingleVideoPage',
-    'CompleteChannelPage',
-    'PageHelp'
-]
+
 
 # Default values for global variables
 spamCommentsID = []
@@ -39,6 +40,13 @@ logMode = False
 
 class SampleApp(Tk):
     __SECRETS_FILE = None
+    PAGES = (
+        StartPage,
+        VideoPage,
+        ChannelPage,
+        LoginPage,
+        HelpPage
+    )
     @property
     def SECRETS_FILE(self):
         if self.__SECRETS_FILE is None:
@@ -54,19 +62,66 @@ class SampleApp(Tk):
         # Cache miss
         creds = None
         if os.path.exists(TOKEN_FILE_NAME):
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE_NAME, scopes=YOUTUBE_READ_WRITE_SSL_SCOPE)
+            try:
+                creds = Credentials.from_authorized_user_file(TOKEN_FILE_NAME, scopes=YOUTUBE_READ_WRITE_SSL_SCOPE)
+            except Exception:
+                # Remove token if invalid
+                os.remove(TOKEN_FILE_NAME)
 
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
                 creds.refresh(Request())    
             else:
-                flow = InstalledAppFlow.from_client_secrets_file(self.__SECRETS_FILE, scopes=YOUTUBE_READ_WRITE_SSL_SCOPE)
-                creds = flow.run_local_server(port=0, authorization_prompt_message="Log in using the browser window.")
-                # Save the credentials for the next run
+                try:
+                    flow = InstalledAppFlow.from_client_secrets_file(self.SECRETS_FILE, scopes=YOUTUBE_READ_WRITE_SSL_SCOPE)
+                    creds = flow.run_local_server(port=0, authorization_prompt_message="Log in using the browser window.")
+                except JSONDecodeError as e:
+                    self.show_error(message="Credentials are not in JSON format.", exception=e)
+            # Save the credentials for the next run
             with open(TOKEN_FILE_NAME, 'w') as token:
                 token.write(creds.to_json())
         return build(API_SERVICE_NAME, API_VERSION, credentials=creds, discoveryServiceUrl=DISCOVERY_SERVICE_URL)
+    
+    __USER__ = None
+    @property
+    def USER(self):
+        # Cache hit
+        if self.__USER__ is not None:
+            return self.__USER__
+        # Cache miss
+        results = self.fetch()
+        channel_id = results["items"][0]["id"]
+        try:
+            channel_title = results["items"][0]["snippet"]["title"]
+        except Exception as e:
+            self.show_error('Channel info could not be obtained')
+        self.__USER__ = (channel_id, channel_title)
+        return self.__USER__
         
+    def convert_comment_id_to_video_id(comment_id):
+        return vidIdDict[comment_id]
+        
+    def fetch_channels(self, part='snippet', fields='items/id,items/snippet/title'):
+        return self.YOUTUBE.channels().list(
+            part=part, #Can also add "contentDetails" or "statistics"
+            mine=True,
+            fields=fields
+        ).execute()
+
+    def filter_video_id(self, video_string):
+        """Returns the video id"""
+        for pattern in [
+            r'.*(?:youtube(?:-nocookie)?\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)/|.*[?&]v=)|youtu\.be/)([^"&?/\s]{11})',
+            r'.*([^"&?/\s]{11})'
+        ]:
+            youtube_regex_match = re.match(
+                pattern,
+                video_string,
+                flags=re.DOTALL+re.IGNORECASE
+            )
+            if youtube_regex_match:
+                return youtube_regex_match.group(1)
+        raise Exception('Video id not found.')
 
     def __init__(self, *args, **kwargs):
         Tk.__init__(self, *args, **kwargs)
@@ -78,14 +133,14 @@ class SampleApp(Tk):
         container.grid_columnconfigure(0, weight=1)
 
         self.frames = {}
-        for F in (StartPage, SingleVideoPage, CompleteChannelPage, PageHelp):
+        for F in self.PAGES:
             page_name = F.__name__
             frame = F(parent=container, controller=self)
             self.frames[page_name] = frame
             frame.grid(row=0, column=0, sticky='nsew')
 
-        self.show_frame(PAGES[0])
-        self.show_menu()
+        self.show_first_frame()
+        self.build_menu()
 
     def set_styles(self):
         self.title_font = tkfont.Font(
@@ -96,13 +151,13 @@ class SampleApp(Tk):
         self.style = Style(self)
         self.style.configure('frame', background='white')
 
-    def show_menu(self):
+    def build_menu(self):
         menubar = Menu(self)
         self.config(menu=menubar)
 
         filemenu = Menu(menubar, tearoff=0)
-        filemenu.add_command(label="Open Secrets file",
-                             command=self.open_secrets_file)
+        filemenu.add_command(label="Authenticate",
+                             command=self.authenticate)
         filemenu.add_command(label="Search video", command=self.search_video)
         filemenu.add_command(label="Search channel", command=self.search_channel)
         filemenu.add_separator()
@@ -116,131 +171,58 @@ class SampleApp(Tk):
         frame = self.frames[page_name]
         frame.tkraise()
 
+    def show_first_frame(self):
+        self.show_frame(self.PAGES[0].__name__)
+
     def open_secrets_file(self):
-        self.__SECRETS_FILE = askopenfilename()
+        self.__SECRETS_FILE = askopenfilename(title="Please select your json credentials")
 
+    def authenticate(self):
+        """Just calling YOUTUBE calls the logic to authenticate"""
+        self.YOUTUBE
+    
+    def get_user(self):
+        results = self.YOUTUBE.channels().list(
+            part="snippet", #Can also add "contentDetails" or "statistics"
+            mine=True,
+            fields="items/id,items/snippet/title"
+        ).execute()
+        return results
 
+    def get_channel_id(self, video_id):
+        results = self.YOUTUBE.videos().list(
+            part="snippet",
+            id=video_id,
+            fields="items/snippet/channelId",
+            maxResults=1
+        ).execute()
+        
+        channel_id = results["items"][0]["snippet"]["channelId"]
+
+        return channel_id
 
     def search_video(self):
-        self.show_frame(PAGES[1])
+        self.show_frame('VideoPage')
 
     def search_channel(self):
-        self.show_frame(PAGES[2])
+        self.show_frame('ChannelPage')
 
     def show_help(self):
-        self.show_frame(PAGES[3])
+        self.show_frame('HelpPage')
 
+    def show_error(self, title="Error", message=traceback.format_exc(), exception=None):
+        """Shows an error popup, stops execution if there is an exception"""
+        messagebox.showerror(title, message)
+        if exception:
+            raise Exception() from exception
     
-    @property
-    def YOUTUBE():
-        pass
+    def show_info(self, title="Info", message=None):
+        """Shows an info popup"""
+        messagebox.showinfo(title, message)
 
-
-class Page(Frame):
-    title = "Page"
-
-    def __init__(self, parent, controller):
-        Frame.__init__(self, parent)
-        self.controller = controller
-
-        top_frame = Frame(self)
-        if str(self).split('.!')[-1] != PAGES[0].lower():
-            Button(
-                top_frame,
-                text="<",
-                command=lambda: controller.show_frame(PAGES[0]),
-                width=3
-            ).pack(side='left', padx=5)
-        Label(
-            top_frame,
-            text=self.title,
-            font=controller.title_font
-        ).pack(side='left', fill='x')
-        top_frame.pack(side='top', fill='x')
-
-
-class StartPage(Page):
-    title = "This is the first page"
-
-    def __init__(self, parent, controller):
-        super().__init__(parent, controller)
-
-        button1 = Button(self, text="Search video",
-                         command=lambda: controller.show_frame(PAGES[1]))
-        button2 = Button(self, text="Search channel",
-                         command=lambda: controller.show_frame(PAGES[2]))
-        button1.pack()
-        button2.pack()
-
-
-class SingleVideoPage(Page):
-    title = "Search single video"
-
-    def __init__(self, parent, controller):
-        super().__init__(parent, controller)
-        self.controller = controller
-        
-        
-        text = Label(self, text="""
-        a
-        b
-        c
-        """
-        )
-
-        text.pack(side='left')
-
-
-class CompleteChannelPage(Page):
-    title = "Search complete channel"
-
-    def __init__(self, parent, controller):
-        super().__init__(parent, controller)
-        
-        text = Label(self, text="""
-        a
-        b
-        c
-        """
-        )
-
-        text.pack(side='left')
-
-
-class PageHelp(Page):
-    title= 'Help'
-
-    def __init__(self, parent, controller):
-        super().__init__(parent, controller)
-
-        text = Label(self, text="""
-        a
-        b
-        c
-        """
-        )
-
-        text.pack(side='left')
-
-class LoginPage(Page):
-    title = "Login"
-
-    def __init__(self, parent, controller):
-        super().__init__(parent, controller)
-
-        text = Label(self, text="""
-        a
-        b
-        c
-        """
-        )
-
-        text.pack(side='left')
-
+    def ask(self, title="Warning", message=''):
+        return messagebox.askquestion(title, message, icon='warning')
 
 if __name__ == '__main__':
     app = SampleApp()
-    try:
-        app.mainloop()
-    except Exception as e:
-        messagebox.showerror('Error', traceback.format_exc())
+    app.mainloop()
